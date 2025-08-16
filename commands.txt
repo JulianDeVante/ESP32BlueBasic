@@ -1,0 +1,5 @@
+LET MyVAR = 0
+print_intro: [ PRINT "Toggling pin 2 times 3" ]
+MY_LED_BLINK: [ PIN (2) ON DELAY 3000 OFF DELAY 3000 LOOP 3 ]
+read_adc_and_print: [ PRINT "Reading ADC on GPIO 34: " READ_ADC 34 TO MyVAR DELAY 1000 PRINT MyVAR DELAY 1000 ]
+GOTO MY_LED_BLINK
