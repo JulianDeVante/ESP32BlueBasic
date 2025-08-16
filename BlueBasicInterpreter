@@ -1,0 +1,853 @@
+// --- INCLUDES ---
+#include <Arduino.h>
+#include <FS.h>                 // File System library
+#include <LittleFS.h>           // For the internal flash file system
+#include <SD.h>                 // SD card library
+#include <SPI.h>                // SPI communication for SD card
+#include <vector>             
+#include <string>               // For String object manipulation
+#include <set>                  // For efficient checking of excluded GPIO pins
+#include <map>                  // For mapping labels, and for variables
+#include <stack>                // For GOSUB/RETURN stack
+#include <WiFi.h>   
+#include <HTTPClient.h>         // For HTTP requests
+#include <driver/dac.h>         // For DAC functionality
+#include <driver/ledc.h>        // For ledcAttachChannel and other LEDC functions
+#include <esp_sleep.h>          // For deep sleep (esp_deep_sleep_start)
+#include <esp_timer.h>          // For non-blocking timers (esp_timer_create, esp_timer_start_periodic)
+#include <esp_system.h>         // For esp_reset_reason() 
+#include <esp_task_wdt.h>       // For watchdog timer
+
+// --- CONFIGURATION ---
+#define SD_CS_PIN 5
+#define DAC_PIN_1 12
+#define DAC_PIN_2 13
+const char* commandFilePath = "/commands.txt";
+const char* bootCountFile = "/boot_count.txt";
+
+// --- DATA TYPE DEFINITIONS ---
+enum ComparisonOperator {
+    COMPARE_NONE, COMPARE_EQ, COMPARE_NE,
+    COMPARE_GT, COMPARE_LT, COMPARE_GE, COMPARE_LE
+};
+struct Command {
+    enum CommandType {
+        TURN_ON_ALL_PINS, TURN_OFF_ALL_PINS, DELAY,
+        TURN_ON_SINGLE_PIN, TURN_OFF_SINGLE_PIN,
+        INCREMENT_VAR, DECREMENT_VAR, PRINT_VALUE,
+        READ_ADC_VALUE, WRITE_DAC_VALUE, SET_PWM_DUTY_CYCLE,
+        READ_SERIAL_INPUT, SERIAL_WRITE_BYTE_VAL
+    };
+    CommandType type;
+    String operand1_str;
+    String operand2_str;
+    
+    Command() : type(TURN_ON_ALL_PINS), operand1_str(""), operand2_str("") {}
+    Command(CommandType t, const String& op1 = "", const String& op2 = "")
+        : type(t), operand1_str(op1), operand2_str(op2) {}
+};
+struct CommandBlock {
+    String label;
+    std::vector<int> controlledPins;
+    std::vector<Command> commands;
+    long loopCount;
+    bool infiniteLoop;
+    long currentLoopIteration;
+    String loopCount_operand;
+    CommandBlock() : loopCount(1), infiniteLoop(false), currentLoopIteration(0), loopCount_operand("") {}
+};
+
+enum ExecutionInstructionType {
+    EXECUTE_DEFINED_BLOCK, PROGRAM_GOTO, PROGRAM_LET_SET,
+    PROGRAM_IF, PROGRAM_GOSUB, PROGRAM_RETURN, PROGRAM_END,
+    PROGRAM_WIFI_CONNECT, PROGRAM_HTTP_GET, PROGRAM_DEEP_SLEEP,
+    PROGRAM_SETUP_PWM_CHANNEL, PROGRAM_SET_TIMER_INTERVAL, PROGRAM_SAVE_RESUME_POINT
+};
+struct ExecutionInstruction {
+    ExecutionInstructionType type;
+    String arg1, arg2, arg3, arg4;
+    int resolvedTargetFlowIndex;
+    ComparisonOperator comparisonOp;
+    ExecutionInstruction(ExecutionInstructionType t, const String& a1 = "", const String& a2 = "", const String& a3 = "", const String& a4 = "") :
+        type(t), arg1(a1), arg2(a2), arg3(a3), arg4(a4), resolvedTargetFlowIndex(-1), comparisonOp(COMPARE_NONE) {}
+
+    ExecutionInstruction(ExecutionInstructionType t, const String& op1, ComparisonOperator op, const String& op2, const String& thenLabel) :
+        type(t), arg1(op1), comparisonOp(op), arg2(op2), arg3(thenLabel), resolvedTargetFlowIndex(-1) {}
+};
+struct ScheduledGosub {
+    int targetProgramFlowIndex;
+    String targetLabel;
+    bool pending;
+};
+
+// --- GLOBAL VARIABLES ---
+// All global containers are now managed with smart pointers or explicitly cleared in setup to prevent memory issues.
+std::set<int> excluded_pins = {3, 19, 20, 43, 44, 45, 46};
+std::map<String, long> variables;
+std::map<String, String> string_variables;
+std::map<String, CommandBlock> definedBlocksByLabel;
+std::vector<ExecutionInstruction> programFlow;
+std::map<String, int> labelToProgramFlowIndexMap;
+int currentProgramFlowIndex = 0;
+std::stack<int> gosubReturnStack;
+std::map<int, int> pwmChannelPins;
+std::map<int, ScheduledGosub> scheduledGosubs;
+RTC_DATA_ATTR int rtcResumeFlowIndex = -1;
+RTC_DATA_ATTR bool rtcWakeFromSleep = false;
+bool sdCardInitialized = false;
+
+// --- FUNCTION PROTOTYPES ---
+void IRAM_ATTR timerCallback(void* arg);
+String stripComments(const String& line);
+long getNumericValue(const String& str);
+String getStringValue(const String& str);
+ComparisonOperator parseComparisonOperator(const String& opStr);
+bool evaluateCondition(const String& op1Str, ComparisonOperator op, const String& op2Str);
+bool isPinControlledByBlock(const CommandBlock& block, int pin);
+bool parseCommandBlockContent(const String& blockContent, CommandBlock& outBlock);
+bool loadProgramFromSD();
+bool initializeSDCard();
+void resetBootCounter();
+
+
+// --- MAIN PROGRAM ---
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+
+
+    // Initialize the watchdog with a 5-second timeout and enable panic (reboot)
+ //   esp_task_wdt_init(5, true); 
+    // Add the current task (the one running setup and loop) to the watchdog list
+ //   esp_task_wdt_add(NULL); 
+
+
+
+    // --- STEP 1: Initialize internal filesystem ---
+    if (!LittleFS.begin(true)) {
+        Serial.println("\n--- CRITICAL FAILURE ---");
+        Serial.println("Could not initialize internal flash (LittleFS). System cannot boot.");
+        Serial.println("System Halted.");
+        while(true) delay(1000);
+    }
+
+    // --- STEP 2: Read, increment, and check boot counter ---
+    long bootCount = 0;
+    if (LittleFS.exists(bootCountFile)) {
+        File file = LittleFS.open(bootCountFile, "r");
+        if (file) {
+            bootCount = file.readString().toInt();
+            file.close();
+        }
+    }
+    bootCount++;
+    File file = LittleFS.open(bootCountFile, "w");
+    if (file) {
+        file.print(bootCount);
+        file.close();
+    } else {
+        Serial.println("\n--- CRITICAL FAILURE ---");
+        Serial.println("Could not write to boot count file. System Halted.");
+        while(true) delay(1000);
+    }
+    Serial.printf("\n--- Boot Attempt #%ld ---\n", bootCount);
+
+    // --- STEP 3: Check for a reboot loop BEFORE trying any external hardware ---
+    if (bootCount > 3) {
+        Serial.println("\n--- FATAL ERROR: REBOOT LOOP DETECTED ---");
+        Serial.println("System has failed to start multiple times in a row.");
+        Serial.println("This may be caused by a missing or faulty SD card module.");
+        Serial.println("\nSystem halted. Check hardware and power-cycle the device.");
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    // --- STEP 4: Attempt to initialize the SD card ---
+    sdCardInitialized = initializeSDCard();
+    if (!sdCardInitialized) {
+        Serial.println("SD card not found or failed to initialize.");
+        Serial.println("This is a non-fatal error. The system will attempt to re-initialize later.");
+        currentProgramFlowIndex = 0; // Start at the beginning, but no program loaded.
+        Serial.println("\n--- Setup Complete. Waiting for SD card... ---");
+        return;
+    }
+
+    // --- STEP 5: Load and parse the program from the SD card ---
+    if (!SD.exists(commandFilePath)) {
+        Serial.println("\n--- FATAL ERROR: Command File Not Found ---");
+        Serial.print("File '"); Serial.print(commandFilePath); Serial.println("' is missing from the SD card.");
+        Serial.println("System halted.");
+        while (true) { delay(1000); }
+    }
+
+    if (!loadProgramFromSD()) {
+        Serial.println("\n--- FATAL ERROR: Program Parsing Failed ---");
+        Serial.println("Check commands.txt for syntax errors near the last reported line.");
+        Serial.println("System halted.");
+        while (true) { delay(1000); }
+    }
+
+    // Initialize hardware pins
+    std::set<int> allUniquePins;
+    for(auto const& [label, block] : definedBlocksByLabel) {
+        for(int pin : block.controlledPins) allUniquePins.insert(pin);
+    }
+    for(auto const& [channel, pin] : pwmChannelPins) {
+        allUniquePins.insert(pin);
+    }
+    for (int pin : allUniquePins) {
+        if (excluded_pins.count(pin)) continue;
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    }
+    dac_output_enable(DAC_CHANNEL_1);
+    dac_output_enable(DAC_CHANNEL_2);
+    dac_output_voltage(DAC_CHANNEL_1, 0);
+    dac_output_voltage(DAC_CHANNEL_2, 0);
+
+    // Check for deep sleep resume
+    esp_reset_reason_t reason = esp_reset_reason();
+    rtcWakeFromSleep = (reason == ESP_RST_DEEPSLEEP);
+    if (rtcWakeFromSleep && rtcResumeFlowIndex != -1 && rtcResumeFlowIndex < programFlow.size()) {
+        currentProgramFlowIndex = rtcResumeFlowIndex;
+        Serial.print("Resuming from deep sleep at index: ");
+        Serial.println(currentProgramFlowIndex);
+    } else {
+        currentProgramFlowIndex = 0;
+        Serial.println("\n--- Setup Complete. Starting Program ---");
+    }
+
+    // --- STEP 6: Reset the boot counter to 0 ONLY after a fully successful setup ---
+    resetBootCounter();
+}
+
+void loop() {
+    // Feed the watchdog timer
+   // esp_task_wdt_reset();
+
+
+
+    // Re-attempt SD card initialization if it failed previously
+    if (!sdCardInitialized) {
+        Serial.println("Re-attempting SD card initialization...");
+        sdCardInitialized = initializeSDCard();
+        if (sdCardInitialized) {
+            Serial.println("SD card initialized successfully. Loading program...");
+            if (SD.exists(commandFilePath) && loadProgramFromSD()) {
+                resetBootCounter();
+                currentProgramFlowIndex = 0; // Restart the program from the beginning
+                Serial.println("\n--- Program Loaded. Starting Program ---");
+            } else {
+                Serial.println("Failed to load program from SD card. Halting.");
+                sdCardInitialized = false; // Stay in this state until a good SD card is inserted.
+            }
+        }
+        delay(5000); // Wait before retrying
+        return;
+    }
+
+    for (auto& pair : scheduledGosubs) { 
+        if (pair.second.pending) { 
+            pair.second.pending = false; 
+            gosubReturnStack.push(currentProgramFlowIndex);
+            currentProgramFlowIndex = pair.second.targetProgramFlowIndex; 
+            return; 
+        } 
+    } 
+    
+    if (currentProgramFlowIndex >= programFlow.size()) { 
+        Serial.println("Program finished. Halting."); 
+        while(true) { 
+            delay(1000);
+        } 
+    } 
+    
+    ExecutionInstruction& inst = programFlow[currentProgramFlowIndex]; 
+    switch (inst.type) { 
+        case PROGRAM_GOTO: 
+            currentProgramFlowIndex = inst.resolvedTargetFlowIndex; 
+            return; 
+        case PROGRAM_GOSUB: 
+            gosubReturnStack.push(currentProgramFlowIndex + 1);
+            currentProgramFlowIndex = inst.resolvedTargetFlowIndex; 
+            return; 
+        case PROGRAM_RETURN: 
+            if (gosubReturnStack.empty()) { 
+                Serial.println("ERROR: RETURN without GOSUB. Halting."); 
+                while(true) { delay(1000); } 
+            } 
+            currentProgramFlowIndex = gosubReturnStack.top(); 
+            gosubReturnStack.pop(); 
+            return; 
+        case PROGRAM_END: 
+            Serial.println("Program ended. Halting."); 
+            while(true) { delay(1000); } 
+        case PROGRAM_LET_SET: { 
+            String varName = inst.arg1; 
+            String varValueExpr = inst.arg2;
+            if (varValueExpr.startsWith("\"")) { 
+                string_variables[varName] = varValueExpr.substring(1, varValueExpr.length() - 1); 
+                variables.erase(varName); 
+            } else { 
+                variables[varName] = getNumericValue(varValueExpr); 
+                string_variables.erase(varName); 
+            } 
+            break; 
+        } 
+        case PROGRAM_IF: 
+            if (evaluateCondition(inst.arg1, inst.comparisonOp, inst.arg2)) { 
+                currentProgramFlowIndex = inst.resolvedTargetFlowIndex; 
+                return; 
+            } 
+            break; 
+        case PROGRAM_WIFI_CONNECT: 
+            WiFi.begin(inst.arg1.c_str(), inst.arg2.c_str()); 
+            break; 
+        case PROGRAM_HTTP_GET: { 
+            HTTPClient http; 
+            http.begin(inst.arg1); 
+            int httpCode = http.GET(); 
+            if (httpCode > 0) { 
+                string_variables[inst.arg2] = http.getString(); 
+            } else { 
+                string_variables[inst.arg2] = "ERROR"; 
+            } 
+            http.end(); 
+            break; 
+        } 
+        case PROGRAM_DEEP_SLEEP: 
+            esp_deep_sleep(getNumericValue(inst.arg1) * 1000ULL); 
+            break; 
+        case PROGRAM_SETUP_PWM_CHANNEL: { 
+            int channel = getNumericValue(inst.arg1); 
+            int pin = getNumericValue(inst.arg2); 
+            long frequency = getNumericValue(inst.arg3); 
+            int resolution = getNumericValue(inst.arg4);
+            ledcAttachChannel(pin, frequency, resolution, channel); 
+            pwmChannelPins[channel] = pin; 
+            break; 
+        } 
+        case PROGRAM_SET_TIMER_INTERVAL: { 
+            int timerId = getNumericValue(inst.arg1); 
+            long intervalMs = getNumericValue(inst.arg2);
+            static esp_timer_handle_t timerHandles[4]; 
+            static int storedTimerIds[4]; 
+            if (timerId >= 0 && timerId < 4) { 
+                storedTimerIds[timerId] = timerId;
+                static char timer_name[20]; 
+                snprintf(timer_name, sizeof(timer_name), "interp_timer_%d", timerId); 
+                esp_timer_create_args_t timer_args = { .callback = &timerCallback, .arg = &storedTimerIds[timerId], .name = timer_name };
+                if (esp_timer_create(&timer_args, &timerHandles[timerId]) == ESP_OK) { 
+                    esp_timer_start_periodic(timerHandles[timerId], intervalMs * 1000); 
+                } 
+            } 
+            break; 
+        } 
+        case PROGRAM_SAVE_RESUME_POINT: 
+            rtcResumeFlowIndex = inst.resolvedTargetFlowIndex; 
+            break;
+        case EXECUTE_DEFINED_BLOCK: { 
+            CommandBlock& block = definedBlocksByLabel[inst.arg1]; 
+            long loopCount = block.loopCount_operand.isEmpty() ? block.loopCount : getNumericValue(block.loopCount_operand);
+            if (!block.infiniteLoop && block.currentLoopIteration >= loopCount) { 
+                block.currentLoopIteration = 0; 
+                currentProgramFlowIndex++; 
+                return;
+            } 
+            for (const auto& cmd : block.commands) { 
+                switch (cmd.type) { 
+                    case Command::TURN_ON_ALL_PINS: 
+                        for (int pin : block.controlledPins) 
+                            if (!excluded_pins.count(pin)) 
+                                digitalWrite(pin, HIGH);
+                        break; 
+                    case Command::TURN_OFF_ALL_PINS: 
+                        for (int pin : block.controlledPins) 
+                            if (!excluded_pins.count(pin)) 
+                                digitalWrite(pin, LOW); 
+                        break; 
+                    case Command::DELAY: 
+                        delay(getNumericValue(cmd.operand1_str)); 
+                        break;
+                    case Command::TURN_ON_SINGLE_PIN: 
+                    case Command::TURN_OFF_SINGLE_PIN: { 
+                        int pin = getNumericValue(cmd.operand1_str); 
+                        if (isPinControlledByBlock(block, pin) && !excluded_pins.count(pin)) { 
+                            digitalWrite(pin, (cmd.type == Command::TURN_ON_SINGLE_PIN) ? HIGH : LOW);
+                        } 
+                        break; 
+                    } 
+                    case Command::INCREMENT_VAR: 
+                        variables[cmd.operand1_str]++; 
+                        break; 
+                    case Command::DECREMENT_VAR: 
+                        variables[cmd.operand1_str]--; 
+                        break; 
+                    case Command::PRINT_VALUE: 
+                        Serial.println(getStringValue(cmd.operand1_str)); 
+                        break; 
+                    case Command::READ_ADC_VALUE: 
+                        variables[cmd.operand2_str] = analogRead(getNumericValue(cmd.operand1_str));
+                        break; 
+                    case Command::WRITE_DAC_VALUE: { 
+                        int pin = getNumericValue(cmd.operand1_str); 
+                        int value = getNumericValue(cmd.operand2_str); 
+                        if (pin == DAC_PIN_1) 
+                            dac_output_voltage(DAC_CHANNEL_1, value);
+                        else if (pin == DAC_PIN_2) 
+                            dac_output_voltage(DAC_CHANNEL_2, value); 
+                        break; 
+                    } 
+                    case Command::SET_PWM_DUTY_CYCLE: { 
+                        int channel = getNumericValue(cmd.operand1_str);
+                        if (pwmChannelPins.count(channel)) { 
+                            ledcWrite(channel, getNumericValue(cmd.operand2_str)); 
+                        } 
+                        break; 
+                    } 
+                    case Command::READ_SERIAL_INPUT: { 
+                        String varName = cmd.operand2_str;
+                        if (Serial.available() > 0) { 
+                            string_variables[varName] = Serial.readStringUntil('\n'); 
+                            string_variables[varName].trim(); 
+                        } 
+                        break; 
+                    } 
+                    case Command::SERIAL_WRITE_BYTE_VAL: 
+                        Serial.write(static_cast<uint8_t>(getNumericValue(cmd.operand1_str))); 
+                        break;
+                } 
+            } 
+            if (!block.infiniteLoop) 
+                block.currentLoopIteration++; 
+            delay(1); 
+            return; 
+        } 
+    } 
+    currentProgramFlowIndex++;
+}
+
+// --- FUNCTION IMPLEMENTATIONS ---
+
+void IRAM_ATTR timerCallback(void* arg) {
+    int* timerIdPtr = static_cast<int*>(arg);
+    int timerId = *timerIdPtr;
+    if (scheduledGosubs.count(timerId)) {
+        scheduledGosubs[timerId].pending = true;
+    }
+}
+
+String stripComments(const String& line) {
+    int commentStart = line.indexOf("//");
+    String result = (commentStart != -1) ?
+    line.substring(0, commentStart) : line;
+    result.trim();
+    return result;
+}
+
+long getNumericValue(const String& str) {
+    String s = str;
+    s.trim();
+    if (s.length() == 0) return 0;
+    if (variables.count(s)) return variables[s];
+    return s.toInt();
+}
+
+String getStringValue(const String& str) {
+    String s = str;
+    s.trim();
+    if (s.length() == 0) return "";
+    if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
+        return s.substring(1, s.length() - 1);
+    }
+    if (string_variables.count(s)) return string_variables[s];
+    if (variables.count(s)) return String(variables[s]);
+    return s;
+}
+
+ComparisonOperator parseComparisonOperator(const String& opStr) {
+    if (opStr == "=" || opStr == "==") return COMPARE_EQ;
+    if (opStr == "!=") return COMPARE_NE;
+    if (opStr == ">") return COMPARE_GT;
+    if (opStr == "<") return COMPARE_LT;
+    if (opStr == ">=") return COMPARE_GE;
+    if (opStr == "<=") return COMPARE_LE;
+    return COMPARE_NONE;
+}
+
+bool evaluateCondition(const String& op1Str, ComparisonOperator op, const String& op2Str) {
+    long val1 = getNumericValue(op1Str);
+    long val2 = getNumericValue(op2Str);
+    switch (op) {
+        case COMPARE_EQ: return val1 == val2;
+        case COMPARE_NE: return val1 != val2;
+        case COMPARE_GT: return val1 > val2;
+        case COMPARE_LT: return val1 < val2;
+        case COMPARE_GE: return val1 >= val2;
+        case COMPARE_LE: return val1 <= val2;
+        default: return false;
+    }
+}
+
+bool isPinControlledByBlock(const CommandBlock& block, int pin) {
+    for (int p : block.controlledPins) {
+        if (p == pin) return true;
+    }
+    return false;
+}
+
+
+
+bool parseCommandBlockContent(const String& blockContent, CommandBlock& outBlock) {
+    String currentBlockLine = blockContent;
+    int startIndex = 0;
+    outBlock.controlledPins.clear();
+    outBlock.commands.clear();
+    outBlock.loopCount = 1;
+    outBlock.infiniteLoop = false;
+    outBlock.currentLoopIteration = 0;
+    outBlock.loopCount_operand = "";
+
+    while (startIndex < currentBlockLine.length()) {
+        // Find the next token (command)
+        int endIndex = currentBlockLine.indexOf(' ', startIndex);
+        if (endIndex == -1) endIndex = currentBlockLine.length();
+        String token = currentBlockLine.substring(startIndex, endIndex);
+        token.trim();
+
+        if (token.length() == 0) {
+            startIndex = endIndex + 1;
+            continue;
+        }
+
+        // --- Helper function to get the next single argument ---
+        auto getNextArg = [&](int& start) -> String {
+            start = currentBlockLine.indexOf(' ', start); // Find start of arg
+            if (start == -1) return "";
+            start++; // Move past space
+            int end = currentBlockLine.indexOf(' ', start);
+            if (end == -1) end = currentBlockLine.length();
+            String arg = currentBlockLine.substring(start, end);
+            start = end; // Update start for the next token
+            return arg;
+        };
+        
+        int nextTokenStart = endIndex;
+
+        if (token.equalsIgnoreCase("PIN")) {
+            int openParen = currentBlockLine.indexOf('(', nextTokenStart);
+            int closeParen = currentBlockLine.indexOf(')', openParen);
+            if (openParen == -1 || closeParen == -1) return false;
+            String pinListString = currentBlockLine.substring(openParen + 1, closeParen);
+            int pinStartIndex = 0;
+            while (pinStartIndex < pinListString.length()) {
+                int pinEndIndex = pinListString.indexOf(',', pinStartIndex);
+                if (pinEndIndex == -1) pinEndIndex = pinListString.length();
+                String pinNumStr = pinListString.substring(pinStartIndex, pinEndIndex);
+                pinNumStr.trim();
+                if (pinNumStr.length() > 0) outBlock.controlledPins.push_back(pinNumStr.toInt());
+                pinStartIndex = pinEndIndex + 1;
+            }
+            nextTokenStart = closeParen;
+        } else if (token.equalsIgnoreCase("ON")) {
+            outBlock.commands.push_back(Command(Command::TURN_ON_ALL_PINS));
+        } else if (token.equalsIgnoreCase("OFF")) {
+            outBlock.commands.push_back(Command(Command::TURN_OFF_ALL_PINS));
+        } else if (token.equalsIgnoreCase("DELAY")) {
+            outBlock.commands.push_back(Command(Command::DELAY, getNextArg(nextTokenStart)));
+        } else if (token.equalsIgnoreCase("ON_PIN") || token.equalsIgnoreCase("OFF_PIN")) {
+            outBlock.commands.push_back(Command((token.equalsIgnoreCase("ON_PIN") ? Command::TURN_ON_SINGLE_PIN : Command::TURN_OFF_SINGLE_PIN), getNextArg(nextTokenStart)));
+        } else if (token.equalsIgnoreCase("INC") || token.equalsIgnoreCase("DEC")) {
+            outBlock.commands.push_back(Command((token.equalsIgnoreCase("INC") ? Command::INCREMENT_VAR : Command::DECREMENT_VAR), getNextArg(nextTokenStart)));
+        } else if (token.equalsIgnoreCase("PRINT")) {
+            int argStartIndex = currentBlockLine.indexOf(' ', startIndex) + 1;
+            String arg = "";
+            if (currentBlockLine.charAt(argStartIndex) == '"') {
+                int argEndIndex = currentBlockLine.indexOf('"', argStartIndex + 1);
+                if (argEndIndex == -1) return false; // Unterminated string
+                arg = currentBlockLine.substring(argStartIndex, argEndIndex + 1);
+                nextTokenStart = argEndIndex;
+            } else {
+                arg = getNextArg(nextTokenStart);
+                nextTokenStart--; // getNextArg goes one space too far
+            }
+            outBlock.commands.push_back(Command(Command::PRINT_VALUE, arg));
+        } else if (token.equalsIgnoreCase("READ_ADC")) {
+            String pinArg = getNextArg(nextTokenStart);
+            String toKeyword = getNextArg(nextTokenStart); // Consume "TO"
+            if (!toKeyword.equalsIgnoreCase("TO")) return false;
+            String varName = getNextArg(nextTokenStart);
+            outBlock.commands.push_back(Command(Command::READ_ADC_VALUE, pinArg, varName));
+        } else if (token.equalsIgnoreCase("WRITE_DAC")) {
+            String pinArg = getNextArg(nextTokenStart);
+            String valueArg = getNextArg(nextTokenStart);
+            outBlock.commands.push_back(Command(Command::WRITE_DAC_VALUE, pinArg, valueArg));
+        } else if (token.equalsIgnoreCase("SET_PWM")) {
+            String channelArg = getNextArg(nextTokenStart);
+            String dutyArg = getNextArg(nextTokenStart);
+            outBlock.commands.push_back(Command(Command::SET_PWM_DUTY_CYCLE, channelArg, dutyArg));
+        } else if (token.equalsIgnoreCase("READ_SERIAL_LINE")) {
+            String toKeyword = getNextArg(nextTokenStart); // Consume "TO"
+            if (!toKeyword.equalsIgnoreCase("TO")) return false;
+            String varName = getNextArg(nextTokenStart);
+            outBlock.commands.push_back(Command(Command::READ_SERIAL_INPUT, "", varName));
+        } else if (token.equalsIgnoreCase("SERIAL_WRITE_BYTE")) {
+            outBlock.commands.push_back(Command(Command::SERIAL_WRITE_BYTE_VAL, getNextArg(nextTokenStart)));
+        } else if (token.equalsIgnoreCase("LOOP")) {
+            outBlock.loopCount_operand = getNextArg(nextTokenStart);
+            if (outBlock.loopCount_operand.equalsIgnoreCase("FOREVER")) {
+                outBlock.infiniteLoop = true;
+            } else {
+                outBlock.loopCount = outBlock.loopCount_operand.toInt();
+            }
+        } else {
+            return false; // Unknown command in block
+        }
+        startIndex = nextTokenStart + 1;
+    }
+    return true;
+}
+
+
+bool loadProgramFromSD() {
+    definedBlocksByLabel.clear();
+    programFlow.clear();
+    labelToProgramFlowIndexMap.clear();
+    variables.clear();
+    string_variables.clear();
+    pwmChannelPins.clear();
+    scheduledGosubs.clear();
+
+    File dataFile;
+    int lineCounter = 0;
+
+    Serial.println("Starting Pass 1: Defining blocks...");
+    dataFile = SD.open(commandFilePath);
+    if (!dataFile) {
+        Serial.print("Error: Failed to open "); Serial.println(commandFilePath);
+        return false;
+    }
+    while (dataFile.available()) {
+        lineCounter++;
+        delay(1); 
+        
+        String line = dataFile.readStringUntil('\n');
+        line = stripComments(line);
+        if (line.length() == 0) continue;
+
+        if (lineCounter % 50 == 0) {
+            Serial.print("...parsing line ");
+            Serial.println(lineCounter);
+        }
+
+        int labelEnd = line.indexOf(':');
+        int openBracket = line.indexOf('[');
+        if (labelEnd != -1 && openBracket != -1 && openBracket > labelEnd) {
+            String label = line.substring(0, labelEnd);
+            label.trim();
+            int closeBracket = line.indexOf(']', openBracket + 1);
+            if (closeBracket == -1) { dataFile.close(); return false; }
+            String blockContent = line.substring(openBracket + 1, closeBracket);
+            CommandBlock newBlock;
+            if (!parseCommandBlockContent(blockContent, newBlock)) { dataFile.close(); return false; }
+            newBlock.label = label;
+            definedBlocksByLabel[label] = newBlock;
+        }
+    }
+    dataFile.close();
+    Serial.print("Pass 1 complete. Parsed "); Serial.print(lineCounter); Serial.println(" lines.");
+    lineCounter = 0;
+    Serial.println("Starting Pass 2: Building program flow...");
+    dataFile = SD.open(commandFilePath);
+    if (!dataFile) {
+        Serial.print("Error: Failed to re-open "); Serial.println(commandFilePath);
+        return false;
+    }
+    while (dataFile.available()) {
+        lineCounter++;
+        delay(1); 
+
+        String line = dataFile.readStringUntil('\n');
+        line = stripComments(line);
+        if (line.length() == 0) continue;
+
+        if (lineCounter % 50 == 0) {
+            Serial.print("...building from line ");
+            Serial.println(lineCounter);
+        }
+        
+        int labelEnd = line.indexOf(':');
+        int openBracket = line.indexOf('[');
+
+        if (labelEnd != -1 && openBracket != -1 && openBracket > labelEnd) {
+            String label = line.substring(0, labelEnd);
+            label.trim();
+            programFlow.push_back(ExecutionInstruction(EXECUTE_DEFINED_BLOCK, label));
+            labelToProgramFlowIndexMap[label] = programFlow.size() - 1;
+        } else if (line.equalsIgnoreCase("RETURN")) {
+            programFlow.push_back(ExecutionInstruction(PROGRAM_RETURN));
+        } else if (line.equalsIgnoreCase("END")) {
+            programFlow.push_back(ExecutionInstruction(PROGRAM_END));
+        } else if (line.startsWith("GOTO ")) {
+            String targetLabel = line.substring(5);
+            targetLabel.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_GOTO, targetLabel));
+        } else if (line.startsWith("GOSUB ")) {
+            String targetLabel = line.substring(6);
+            targetLabel.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_GOSUB, targetLabel));
+        } else if (line.startsWith("LET ") || line.startsWith("SET ")) {
+            String remainder = line.substring(4);
+            remainder.trim();
+            int eqPos = remainder.indexOf('=');
+            if (eqPos == -1) { dataFile.close(); return false; }
+            String varName = remainder.substring(0, eqPos);
+            varName.trim();
+            String varValue = remainder.substring(eqPos + 1);
+            varValue.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_LET_SET, varName, varValue));
+        } else if (line.startsWith("IF ")) {
+            String remainder = line.substring(3);
+            remainder.trim();
+            int thenPos = remainder.indexOf(" THEN GOTO ");
+            if (thenPos == -1) { dataFile.close(); return false; }
+            String conditionPart = remainder.substring(0, thenPos);
+            conditionPart.trim();
+            String thenTargetLabel = remainder.substring(thenPos + 11);
+            thenTargetLabel.trim();
+            int opPos = -1;
+            String opStrs[] = {"==", "!=", ">=", "<=", ">", "<", "="};
+            ComparisonOperator compOp = COMPARE_NONE;
+            String opStrFound = "";
+            for(const auto& op : opStrs){
+                if((opPos = conditionPart.indexOf(op)) != -1){
+                    compOp = parseComparisonOperator(op);
+                    opStrFound = op;
+                    break;
+                }
+            }
+            if(compOp == COMPARE_NONE) { dataFile.close();
+            return false; }
+            String op1 = conditionPart.substring(0, opPos);
+            op1.trim();
+            String op2 = conditionPart.substring(opPos + opStrFound.length());
+            op2.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_IF, op1, compOp, op2, thenTargetLabel));
+        } else if (line.startsWith("WIFI_CONNECT ")) {
+            String remainder = line.substring(13);
+            remainder.trim();
+            int firstQuote = remainder.indexOf('"');
+            int secondQuote = remainder.indexOf('"', firstQuote + 1);
+            if (firstQuote == -1 || secondQuote == -1) { dataFile.close(); return false; }
+            String ssid = remainder.substring(firstQuote + 1, secondQuote);
+            int thirdQuote = remainder.indexOf('"', secondQuote + 1);
+            int fourthQuote = remainder.indexOf('"', thirdQuote + 1);
+            String password = "";
+            if (thirdQuote != -1 && fourthQuote != -1) {
+                password = remainder.substring(thirdQuote + 1, fourthQuote);
+            }
+            programFlow.push_back(ExecutionInstruction(PROGRAM_WIFI_CONNECT, ssid, password));
+        } else if (line.startsWith("HTTP_GET ")) {
+            String remainder = line.substring(9);
+            remainder.trim();
+            int toPos = remainder.indexOf(" TO ");
+            if (toPos == -1) { dataFile.close(); return false; }
+            String url = remainder.substring(0, toPos);
+            url.trim();
+            if (url.startsWith("\"") && url.endsWith("\"")) url = url.substring(1, url.length() - 1);
+            String varName = remainder.substring(toPos + 4);
+            varName.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_HTTP_GET, url, varName));
+        } else if (line.startsWith("DEEP_SLEEP ")) {
+            String duration = line.substring(11);
+            duration.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_DEEP_SLEEP, duration));
+        } else if (line.startsWith("SETUP_PWM ")) {
+            String remainder = line.substring(10);
+            remainder.trim();
+            String args[4];
+            int currentArg = 0;
+            int lastIndex = 0;
+            for(int i=0; i<remainder.length() && currentArg < 3; ++i){
+                if(remainder.charAt(i) == ' '){
+                    args[currentArg] = remainder.substring(lastIndex, i);
+                    args[currentArg++].trim();
+                    lastIndex = i+1;
+                }
+            }
+            args[currentArg] = remainder.substring(lastIndex);
+            args[currentArg].trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_SETUP_PWM_CHANNEL, args[0], args[1], args[2], args[3]));
+        } else if (line.startsWith("SET_TIMER_INTERVAL ")) {
+            String remainder = line.substring(19);
+            remainder.trim();
+            int gosubPos = remainder.indexOf(" GOSUB ");
+            if(gosubPos == -1) { dataFile.close(); return false; }
+            String timerPart = remainder.substring(0, gosubPos);
+            String targetLabel = remainder.substring(gosubPos + 7);
+            targetLabel.trim();
+            int spacePos = timerPart.indexOf(' ');
+            String timerId = timerPart.substring(0, spacePos);
+            timerId.trim();
+            String intervalMs = timerPart.substring(spacePos + 1);
+            intervalMs.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_SET_TIMER_INTERVAL, timerId, intervalMs, targetLabel));
+        } else if (line.startsWith("SAVE_RESUME_POINT ")) {
+            String label = line.substring(18);
+            label.trim();
+            programFlow.push_back(ExecutionInstruction(PROGRAM_SAVE_RESUME_POINT, label));
+        }
+    }
+    dataFile.close();
+    Serial.print("Pass 2 complete. Built "); Serial.print(programFlow.size()); Serial.println(" instructions.");
+    for (size_t i = 0; i < programFlow.size(); ++i) {
+        ExecutionInstruction& inst = programFlow[i];
+        String targetLabel = "";
+        if (inst.type == PROGRAM_GOTO || inst.type == PROGRAM_GOSUB || inst.type == PROGRAM_SAVE_RESUME_POINT) {
+            targetLabel = inst.arg1;
+        } else if (inst.type == PROGRAM_IF) {
+            targetLabel = inst.arg3;
+        } else if (inst.type == PROGRAM_SET_TIMER_INTERVAL) {
+            targetLabel = inst.arg3;
+            if (labelToProgramFlowIndexMap.count(targetLabel)) {
+                int timerId = getNumericValue(inst.arg1);
+                scheduledGosubs[timerId].targetProgramFlowIndex = labelToProgramFlowIndexMap[targetLabel];
+                scheduledGosubs[timerId].targetLabel = targetLabel;
+                scheduledGosubs[timerId].pending = false;
+            } else return false;
+        }
+
+        if (!targetLabel.isEmpty()) {
+            if (labelToProgramFlowIndexMap.count(targetLabel)) {
+                inst.resolvedTargetFlowIndex = labelToProgramFlowIndexMap[targetLabel];
+            } else return false;
+        }
+    }
+
+    return !programFlow.empty();
+}
+
+bool initializeSDCard() {
+    Serial.print("Initializing SD card on pin ");
+    Serial.println(SD_CS_PIN);
+    if (!SD.begin(SD_CS_PIN)) {
+        return false;
+    }
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        return false;
+    }
+    return true;
+}
+
+void resetBootCounter() {
+    File file = LittleFS.open(bootCountFile, "w");
+    if (file) {
+        file.print(0);
+        file.close();
+        Serial.println("Boot counter has been reset to 0.");
+    }
+}
