@@ -21,5 +21,4 @@ I have included in this repository:
   (2)Example commands.txt file
   (3) User Manual
 
- ...let me know of any issues or bugs
-   Have fun!
+ ...let me know of any issues or bugs --- Have fun!
