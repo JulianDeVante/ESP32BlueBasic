@@ -1,0 +1,579 @@
+Julian DeVanbte - August 16th 2025
+
+Arduino ESP32 and ESP32-S3 Command Interpreter Manual (Advanced) 📚
+This manual provides a complete guide to writing advanced scripts for your ESP32-S3 using the custom command interpreter. The interpreter now leverages more of the ESP32-S3's capabilities, allowing you to control GPIO pins, manage program flow, use variables (numerical and string), implement conditional logic, perform analog I/O, manage PWM, connect to Wi-Fi, make HTTP requests, and even put the device into deep sleep, with a new mechanism to "resume" execution after deep sleep. All instructions are read from a commands.txt file on an SD card.
+
+1. Getting Started 🚀
+To use the interpreter, you need:
+
+An ESP32 or ESP32-S3 board (should work with any Espressif Boards)
+
+An SD card module connected to your ESP32-S3. The SD_CS_PIN is configured as GPIO 10 in the code. Adjust this if your hardware setup differs.
+
+A commands.txt file on the root of your SD card. This file contains the script your interpreter will execute.
+
+Upon powering on the ESP32-S3, the interpreter will attempt to:
+
+Initialize the SD card.
+
+Load and parse the commands.txt file.
+
+Set up all necessary GPIO pins as outputs, and initialize DAC pins.
+
+Check if it woke from deep sleep and, if so, resume execution from a saved point.
+
+Begin executing the program instructions.
+
+Any critical errors during loading will halt the program, and detailed messages will be printed to the Serial Monitor (at 115200 baud).
+
+2. Core Concepts 💡
+Labels
+Labels are named reference points in your script. They allow GOTO, GOSUB, IF, SET_TIMER_INTERVAL, and SAVE_RESUME_POINT commands to jump to or refer to specific parts of your program. A label is defined by a name followed by a colon (:).
+
+Example: MY_LABEL:
+
+Program Flow vs. Command Blocks
+The interpreter distinguishes between two types of instructions:
+
+Program Flow Instructions: These are top-level commands that dictate the overall sequence of execution. They are written directly on a line in commands.txt.
+
+Examples: GOTO, LET, SET, IF, GOSUB, RETURN, END, WIFI_CONNECT, HTTP_GET, DEEP_SLEEP, SETUP_PWM, SET_TIMER_INTERVAL, SAVE_RESUME_POINT.
+
+A labeled command block definition (e.g., MY_BLOCK: [ ... ]) is also a program flow instruction as it defines a block and a point in the flow.
+
+In-Block Commands: These are specific actions performed within a Command Block, always enclosed by square brackets [ ].
+
+Examples: PIN, ON, OFF, DELAY, ON_PIN, OFF_PIN, INC, DEC, PRINT, READ_ADC, WRITE_DAC, SET_PWM, READ_SERIAL_LINE, SERIAL_WRITE_BYTE, LOOP.
+
+Variables
+The interpreter supports two types of global variables:
+
+Numerical Variables: Store long integer values.
+
+Declaration: Implicitly declared when first assigned a value using LET or SET.
+
+Default Value: 0 if used before assignment.
+
+Usage: Can be used in commands requiring numbers (e.g., DELAY, LOOP, IF conditions, READ_ADC WRITE_DAC, SET_PWM, SERIAL_WRITE_BYTE).
+
+String Variables: Store String (text) values.
+
+Declaration: Implicitly declared when first assigned a string value using LET or SET.
+
+Default Value: Empty string ("") if used before assignment.
+
+Usage: Primarily for storing Wi-Fi network names/passwords, HTTP responses, or serial input. Can be printed using PRINT.
+
+Important Note on Persistence: Variables defined with LET or SET are stored in RAM and will be lost when the ESP32-S3 enters DEEP_SLEEP and restarts. To preserve data across deep sleep cycles, you must declare variables in the underlying C++ code using RTC_DATA_ATTR (as rtcResumeFlowIndex and rtcWakeFromSleep are). The interpreter does not currently expose a way to define RTC_DATA_ATTR variables directly from the script.
+
+Comments
+You can add comments to your commands.txt file using //. Anything after // on a line will be ignored by the interpreter.
+
+Example: GOTO START_ROUTINE // Jump to the beginning of the main process
+
+3. Command Reference 📜
+A. Program Flow Instructions (Top-Level)
+These commands control the overall sequence of execution within your commands.txt file.
+
+LABEL: (Command Block Definition)
+
+Syntax: LABEL_NAME: [ <in-block commands> ]
+
+Purpose: Defines a reusable block of commands and gives it a LABEL_NAME. This label can be used by GOTO, GOSUB, IF, SET_TIMER_INTERVAL, and SAVE_RESUME_POINT to jump to or refer to this block.
+
+Example:
+
+MY_LED_BLINK: [ PIN (2) ON DELAY 500 OFF DELAY 500 LOOP 2 ]
+
+Note: Each command block must contain a PIN command specifying the GPIO pins it controls.
+
+GOTO <LABEL_NAME>
+
+Syntax: GOTO TARGET_LABEL
+
+Purpose: Unconditionally jumps the program execution to the instruction identified by TARGET_LABEL.
+
+Example:
+
+GOTO MAIN_LOOP
+...
+MAIN_LOOP: [ // commands for main loop ]
+
+GOSUB <LABEL_NAME>
+
+Syntax: GOSUB SUBROUTINE_LABEL
+
+Purpose: Jumps to a SUBROUTINE_LABEL like GOTO, but crucially, it stores the current position in the program flow. This allows you to RETURN to the instruction immediately after the GOSUB call.
+
+Example:
+
+GOSUB INITIATE_PINS // Call a setup subroutine
+PRINT "Pins initialized."
+GOTO MAIN_PROCESS
+...
+INITIATE_PINS: [ PIN (5) ON DELAY 100 ]
+RETURN // Go back to "PRINT 'Pins initialized.'"
+
+RETURN
+
+Syntax: RETURN
+
+Purpose: Used within a subroutine called by GOSUB or a timed GOSUB. It jumps back to the instruction immediately following the most recent GOSUB call. If there's no active GOSUB call, it will halt the program with an error.
+
+Example: (See GOSUB example above)
+
+LET <VAR_NAME> = <VALUE> / SET <VAR_NAME> = <VALUE>
+
+Syntax:
+
+LET myNumVar = 100
+
+SET anotherNumVar = myNumVar
+
+LET myStringVar = "Hello"
+
+SET anotherStringVar = myStringVar
+
+Purpose: Assigns a VALUE to a variable named VAR_NAME. VALUE can be a literal number, a numerical variable, a literal string (enclosed in " quotes), or a string variable. Using a string literal automatically makes the variable a string variable; using a number makes it a numerical variable.
+
+Example:
+
+LET initialDelay = 1000
+SET blinkCount = 5
+LET deviceName = "MyESP32"
+SET statusMessage = "Ready"
+
+IF <OPERAND1> <OPERATOR> <OPERAND2> THEN GOTO <LABEL_NAME>
+
+Syntax: IF myValue > 500 THEN GOTO ACTIVATE_ALERT
+
+Purpose: Executes a GOTO command to LABEL_NAME only if the CONDITION is true. If false, the program continues to the next instruction in sequence.
+
+Operands: OPERAND1 and OPERAND2 can be literal numbers or numerical variable names.
+
+Operators:
+
+= or == (Equal to)
+
+!= (Not equal to)
+
+> (Greater than)
+
+< (Less than)
+
+>= (Greater than or equal to)
+
+<= (Less than or equal to)
+
+Example:
+
+LET sensorReading = 600
+IF sensorReading > 550 THEN GOTO HIGH_TEMP_ALARM
+PRINT "Temperature normal."
+GOTO CONTINUE_PROCESS
+
+END
+
+Syntax: END
+
+Purpose: Immediately halts the execution of the entire program. No further instructions will be processed.
+
+Example:
+
+PRINT "Program complete."
+END
+
+WIFI_CONNECT "<SSID>" "<PASSWORD>"
+
+Syntax: WIFI_CONNECT "MyNetworkName" "MySecurePass"
+
+Purpose: Attempts to connect the ESP32-S3 to the specified Wi-Fi network. This is a non-blocking command, meaning the program will continue executing immediately after sending the connection request. You'll need to implement logic (e.g., IF WIFI_STATUS == CONNECTED THEN GOTO ...) to wait for connection if needed (though WIFI_STATUS is not yet a command).
+
+Example:
+
+WIFI_CONNECT "HomeRouter" "password123"
+PRINT "Connecting to WiFi..."
+DELAY 5000 // Give it some time to connect
+
+HTTP_GET "<URL>" TO <VAR_NAME>
+
+Syntax: HTTP_GET "http://api.example.com/data" TO apiResponse
+
+Purpose: Performs an HTTP GET request to the specified URL. The response body (truncated to 50 characters in serial output for brevity) is stored in the string variable VAR_NAME. If the request fails, VAR_NAME will be set to "ERROR". This is a blocking command.
+
+Example:
+
+HTTP_GET "http://worldtimeapi.org/api/ip" TO currentTimeData
+PRINT "API Data: " currentTimeData
+
+DEEP_SLEEP <MILLISECONDS>
+
+Syntax: DEEP_SLEEP 60000 or DEEP_SLEEP sleepDurationVar
+
+Purpose: Puts the ESP32-S3 into deep sleep mode for the specified duration (in milliseconds). The chip consumes very little power during deep sleep. Upon waking, the ESP32-S3 will restart from setup(), effectively beginning your script from the start of commands.txt again. This command is usually the last instruction before a planned reset cycle.
+
+Example:
+
+PRINT "Going to sleep for 5 minutes."
+DEEP_SLEEP 300000 // 5 minutes = 300000 ms
+// Code below this line will only run if the ESP32-S3 is reset by other means.
+
+SETUP_PWM <CHANNEL> <PIN_NUMBER> <FREQUENCY> <RESOLUTION>
+
+Syntax: SETUP_PWM 0 13 5000 8
+
+Purpose: Configures one of the ESP32-S3's 16 LEDC PWM channels (0-15). This must be called before using SET_PWM for that channel.
+
+CHANNEL: PWM channel ID (0-15).
+
+PIN_NUMBER: The GPIO pin to output the PWM signal on.
+
+FREQUENCY: The frequency of the PWM signal in Hz (e.g., 5000 for 5kHz).
+
+RESOLUTION: The bit-depth of the PWM duty cycle (e.g., 8 for 0-255, 10 for 0-1023, 12 for 0-4095).
+
+Example:
+
+SETUP_PWM 0 13 5000 8 // Configure channel 0 on pin 13 for 5kHz, 8-bit PWM
+
+SET_TIMER_INTERVAL <ID> <MILLISECONDS> GOSUB <LABEL>
+
+Syntax: SET_TIMER_INTERVAL 0 1000 GOSUB SENSOR_READ_SUB
+
+Purpose: Sets up a periodic timer. After every MILLISECONDS interval, the interpreter will perform a GOSUB to the specified LABEL. This allows for non-blocking, recurring background tasks.
+
+ID: A unique identifier for this timer (e.g., 0, 1, 2...). Max 4 timers (0-3) supported in current implementation.
+
+MILLISECONDS: The interval duration.
+
+GOSUB <LABEL>: The subroutine to call when the timer expires.
+
+Note: The actual GOSUB call happens in the main loop() function, not directly within the timer interrupt, to avoid issues with complex operations in an ISR.
+
+Example:
+
+SET_TIMER_INTERVAL 0 5000 GOSUB CHECK_DOOR_SENSOR // Check sensor every 5 seconds
+
+SAVE_RESUME_POINT <LABEL_NAME>
+
+Syntax: SAVE_RESUME_POINT AFTER_SLEEP_SEQUENCE
+
+Purpose: This command marks a specific point in your program (the instruction corresponding to LABEL_NAME) as the "resume point" for the next wake-up from deep sleep. The programFlow index of this label is stored in RTC memory. Upon waking from deep sleep, the interpreter's C++ setup() function will detect the wake-up and set currentProgramFlowIndex to this saved point.
+
+Example:
+
+// ... some operations ...
+SAVE_RESUME_POINT CONTINUE_AFTER_SLEEP
+DEEP_SLEEP 300000 // Go to sleep
+
+CONTINUE_AFTER_SLEEP:
+PRINT "Hello! Resumed from sleep!"
+// ... continue operations from here ...
+
+Important: Your commands.txt script must include logic at the very beginning (e.g., INIT_BOOT in the example program) to check if it's waking from deep sleep and then GOTO to the appropriate resume label. Without this, the script will always start from the very first instruction in commands.txt after any boot.
+
+B. In-Block Commands (Within [ ] brackets)
+These commands define the specific actions performed inside a Command Block.
+
+PIN (<PIN_NUMBER_1>, <PIN_NUMBER_2>, ...)
+
+Syntax: PIN (2, 4, 12)
+
+Purpose: Specifies which GPIO pins this particular command block will control. This must be the first command within any block. Any ON, OFF, ON_PIN, OFF_PIN commands within this block will operate on these defined pins.
+
+Example:
+
+MY_BLOCK: [ PIN (2, 3) ON DELAY 1000 OFF ]
+
+ON / OFF
+
+Syntax: ON or OFF
+
+Purpose:
+
+ON: Sets all pins specified in the block's PIN command to HIGH (turns them on).
+
+OFF: Sets all pins specified in the block's PIN command to LOW (turns them off).
+
+Example:
+
+[ PIN (5, 6) ON DELAY 500 OFF ]
+
+ON_PIN <PIN_NUMBER> / OFF_PIN <PIN_NUMBER>
+
+Syntax: ON_PIN 5 or OFF_PIN myPinVar
+
+Purpose: Turns a single specified pin HIGH or LOW. PIN_NUMBER can be a literal number or a numerical variable. The pin should ideally be among those defined in the block's PIN command, though it will still attempt to control it if valid.
+
+Example:
+
+[ PIN (7, 8) ON_PIN 7 DELAY 200 ON_PIN 8 DELAY 200 OFF_PIN 7 ]
+
+DELAY <MILLISECONDS>
+
+Syntax: DELAY 1000 or DELAY myDelayVar
+
+Purpose: Pauses program execution for the specified number of MILLISECONDS. MILLISECONDS can be a literal number or a numerical variable.
+
+Example:
+
+[ PIN (10) ON DELAY 2500 OFF ]
+
+INC <VAR_NAME> / DEC <VAR_NAME>
+
+Syntax: INC counter or DEC loopCount
+
+Purpose: Increments (INC) or decrements (DEC) the value of a numerical variable VAR_NAME by 1. If VAR_NAME doesn't exist, it's initialized to 0 first.
+
+Example:
+
+[ INC stepCount PRINT "Step: " stepCount ]
+
+PRINT <TEXT>
+
+Syntax: PRINT "Hello" or PRINT myVariable
+
+Purpose: Prints TEXT to the Serial Monitor. TEXT can be a literal string (enclosed in double quotes), the name of a numerical variable (whose value will be printed), or the name of a string variable (whose content will be printed).
+
+Example:
+
+[ LET myStatus = "Running" PRINT "Status: " myStatus PRINT "Counter: " myNumericalCounter ]
+
+READ_ADC <PIN_NUMBER> TO <VAR_NAME>
+
+Syntax: READ_ADC 34 TO sensorValue
+
+Purpose: Reads the 12-bit analog value (0-4095) from the specified ADC-capable PIN_NUMBER and stores it in the numerical variable VAR_NAME. PIN_NUMBER can be a literal or variable.
+
+Example:
+
+[ READ_ADC 34 TO lightSensor ]
+
+WRITE_DAC <PIN_NUMBER> <VALUE>
+
+Syntax: WRITE_DAC 25 128 or WRITE_DAC myDacPin brightness
+
+Purpose: Outputs an 8-bit analog voltage (0-255) on a DAC-capable pin (GPIO 25 or 26). PIN_NUMBER and VALUE can be literals or variables.
+
+Example:
+
+[ WRITE_DAC 26 200 ]
+
+SET_PWM <CHANNEL> <DUTY_CYCLE>
+
+Syntax: SET_PWM 0 128 or SET_PWM myChannel lightLevel
+
+Purpose: Sets the duty cycle (brightness for LEDs, speed for motors) for a previously configured PWM CHANNEL. CHANNEL and DUTY_CYCLE can be literals or variables. DUTY_CYCLE range depends on the resolution set in SETUP_PWM.
+
+Example:
+
+[ SET_PWM 0 200 ] // Assuming channel 0 was setup with 8-bit resolution
+
+READ_SERIAL_LINE TO <VAR_NAME>
+
+Syntax: READ_SERIAL_LINE TO userInput
+
+Purpose: Waits for input from the Serial Monitor until a newline character is received (or a timeout). The read string is stored in the string variable VAR_NAME. This is a blocking command.
+
+Example:
+
+[ PRINT "Enter your name: " READ_SERIAL_LINE TO userName ]
+
+SERIAL_WRITE_BYTE <VALUE>
+
+Syntax: SERIAL_WRITE_BYTE 10 (sends ASCII Line Feed) or SERIAL_WRITE_BYTE myByteVar
+
+Purpose: Writes a single byte (0-255) to the Serial Monitor. VALUE can be a literal or a numerical variable.
+
+Example:
+
+[ SERIAL_WRITE_BYTE 27 // ASCII ESC character ]
+
+LOOP <COUNT> / LOOP FOREVER
+
+Syntax: LOOP 5 or LOOP myLoopVar or LOOP FOREVER
+
+Purpose: Specifies how many times this specific command block should repeat its sequence of commands before the program moves to the next top-level instruction.
+
+COUNT: A positive number or a numerical variable indicating repetitions. If COUNT is 0 or negative, it defaults to 1.
+
+FOREVER: The block will repeat indefinitely.
+
+Example:
+
+BLINK_FAST: [ PIN (1) ON DELAY 100 OFF DELAY 100 LOOP FOREVER ]
+
+Note: If no LOOP command is specified, the block defaults to looping once.
+
+4. Complete Example Program (commands.txt) 📝
+This example demonstrates how to combine various features for a more complex scenario, including the new deep sleep resume functionality.
+
+// --- Global Variable Initialization (These are reset on every boot) ---
+LET globalDelay = 500       // Numerical variable for delays
+LET temperature = 0         // Numerical variable for sensor reading
+LET commandInput = ""       // String variable for serial input
+
+// --- Hardware Setup (Top-Level Program Flow) ---
+SETUP_PWM 0 13 5000 8       // Configure PWM channel 0 on pin 13 (5kHz, 8-bit resolution)
+
+// --- Program Start / Deep Sleep Resume Logic ---
+// This section handles where the program starts based on the reset reason.
+// 'rtcWakeFromSleep' is a C++ RTC variable set by setup() if woke from deep sleep.
+INIT_BOOT:
+    IF rtcWakeFromSleep == 1 THEN GOTO RESUME_FROM_SLEEP
+
+    // If not waking from deep sleep (first boot or external reset)
+    PRINT "--- First Boot / External Reset ---"
+    // Any variables you want to persist (like a boot count) need to be RTC_DATA_ATTR in C++
+    // rtcResumeFlowIndex is automatically reset to -1 by C++ setup() for non-deep sleep boots.
+    GOTO START_DEMO // Proceed with the normal demo start
+
+// --- Deep Sleep Resume Point ---
+RESUME_FROM_SLEEP:
+    PRINT "--- Resuming from Deep Sleep ---"
+    // 'SAVED_RESUME_LABEL' below will be the target.
+    // The C++ setup() has already set currentProgramFlowIndex to this point.
+    // We explicitly GOTO it here for clarity in the script's logic flow.
+    GOTO SAVED_RESUME_LABEL 
+
+// --- Subroutine: Blinks an LED ---
+BLINK_LED_SUB: [
+    PIN (13) ON_PIN 13          // Turn on LED on pin 13
+    DELAY globalDelay           // Use the global variable for delay
+    OFF_PIN 13                  // Turn off LED on pin 13
+    DELAY globalDelay
+    RETURN                      // Go back to the instruction after GOSUB
+]
+
+// --- Command Block: Simulates reading a sensor and adjusting PWM ---
+READ_TEMP_AND_PWM: [
+    PIN (34, 13) // Pin 34 for ADC sensor, Pin 13 for PWM output (managed by SETUP_PWM 0 13...)
+    READ_ADC 34 TO temperature  // Read analog value from pin 34 into 'temperature'
+    PRINT "Sensor Reading: " temperature
+
+    // Map temperature to PWM duty cycle: 0-4095 (ADC) to 0-255 (PWM 8-bit)
+    SET pwmDuty = temperature / 16
+    SET_PWM 0 pwmDuty           // Set PWM duty cycle on channel 0
+
+    // Conditional alert based on temperature
+    IF temperature > 2000 THEN GOSUB HIGH_TEMP_ALERT
+    DELAY 500                   // Small delay before returning
+    RETURN
+]
+
+// --- Subroutine: High Temperature Alert ---
+HIGH_TEMP_ALERT: [
+    PIN (14) // Alert LED on pin 14
+    PRINT "!!! HIGH TEMPERATURE ALERT !!!"
+    ON_PIN 14 // Turn on alert LED
+    DELAY 200
+    OFF_PIN 14
+    DELAY 200
+    ON_PIN 14
+    DELAY 200
+    OFF_PIN 14
+    RETURN
+]
+
+// --- Timer Triggered Subroutine ---
+// This subroutine will be called every 2 seconds by Timer ID 1
+TIMER_HEARTBEAT: [
+    PIN (13) // Pin 13, also used by PWM, but this will momentarily override it.
+    PRINT "Heartbeat!"
+    ON_PIN 13
+    DELAY 50
+    OFF_PIN 13
+    RETURN
+]
+
+// --- Normal Program Start Point ---
+START_DEMO:
+    PRINT "Interpreter Demo Starting..."
+    PRINT "Connecting to WiFi..."
+    WIFI_CONNECT "YourSSID" "YourWiFiPassword" // !!! REPLACE WITH YOUR ACTUAL WI-FI CREDENTIALS !!!
+    DELAY 8000 // Give time for Wi-Fi to connect (blocking for demonstration)
+    PRINT "WiFi connection attempt finished."
+
+    // Setup a periodic timer to call TIMER_HEARTBEAT every 2 seconds
+    SET_TIMER_INTERVAL 1 2000 GOSUB TIMER_HEARTBEAT
+
+MAIN_LOOP:
+    PRINT "--- Main Loop Iteration ---"
+    GOSUB BLINK_LED_SUB         // Blink the main LED
+    GOSUB READ_TEMP_AND_PWM     // Read sensor and set PWM
+
+    // Test HTTP GET (requires successful Wi-Fi connection)
+    HTTP_GET "http://worldtimeapi.org/api/ip" TO apiResponse // Get public IP info
+    PRINT "HTTP Response: " apiResponse
+
+    // Test DAC output: set pin 25 to a value based on temperature
+    SET dacOutput = temperature / 16 // Map 0-4095 to 0-255
+    WRITE_DAC 25 dacOutput
+    PRINT "DAC Pin 25 set to: " dacOutput
+
+    PRINT "Enter 'HALT' to end, 'SLEEP' to deep sleep, or anything else to repeat: "
+    READ_SERIAL_LINE TO commandInput // Read user input from Serial Monitor
+    PRINT "You entered: " commandInput
+
+    IF commandInput == "HALT" THEN GOTO END_PROGRAM
+    IF commandInput == "SLEEP" THEN GOTO PREPARE_FOR_SLEEP
+    GOTO MAIN_LOOP // Loop indefinitely unless 'HALT' or 'SLEEP' is entered
+
+// --- Deep Sleep Preparation ---
+PREPARE_FOR_SLEEP:
+    PRINT "Saving resume point for next boot."
+    SAVE_RESUME_POINT SAVED_RESUME_LABEL // Save where we want to resume from
+    PRINT "Entering deep sleep for 1 minute."
+    DEEP_SLEEP 60000 // Sleep for 1 minute (60,000 milliseconds)
+    // The program will restart from setup() after waking up, and jump to SAVED_RESUME_LABEL
+
+// --- Label to Resume To ---
+SAVED_RESUME_LABEL:
+    PRINT "Woke up and resumed here from SAVED_RESUME_LABEL!"
+    // You can add specific resume logic here (e.g., re-initialize states needed after sleep)
+    GOTO MAIN_LOOP // Continue with the main loop after resuming
+
+// --- Program End ---
+END_PROGRAM:
+    PRINT "Program finished."
+    END // Truly halt the program
+
+
+5. Troubleshooting and Tips 💡
+Serial Monitor: Always keep your Serial Monitor open (at 115200 baud) when running the program. It provides crucial debug messages, errors, and PRINT outputs.
+
+SD Card Issues: If the SD card fails to mount, check wiring, card format (FAT32), and ensure the SD_CS_PIN is correct for your setup.
+
+Syntax Errors: The interpreter tries to catch syntax errors during loading. If it halts during setup(), carefully review the last error message on the Serial Monitor and check the corresponding line in commands.txt. Pay attention to brackets, commas, spaces, and command spellings.
+
+Pin Validation: The interpreter checks for "excluded pins" (3, 19, 20, 43-46 on ESP32-S3). Avoid using these for general I/O.
+
+ADC Pins: Only specific ESP32-S3 pins support ADC. Consult your ESP32-S3 board's pinout diagram.
+
+DAC Pins: Only GPIO 25 and GPIO 26 support DAC output.
+
+PWM Channels: The ESP32-S3 has 16 PWM channels (0-15). Ensure you SETUP_PWM a channel before trying to SET_PWM its duty cycle.
+
+Wi-Fi Connectivity: WIFI_CONNECT is non-blocking. If you need to perform actions only after Wi-Fi connects, you'll have to add conditional logic (e.g., IF WiFi_Status_Variable == CONNECTED THEN GOTO ...). Currently, there's no direct WIFI_STATUS command in the interpreter, so you'd rely on the native C++ WiFi.status() function if you were to extend it further.
+
+HTTP Requests: HTTP_GET is blocking. The program will pause until the request completes or times out. Ensure your Wi-Fi is connected before making requests.
+
+Blocking I/O: DELAY and READ_SERIAL_LINE are blocking. For applications requiring responsiveness, use timers (SET_TIMER_INTERVAL) or structure your program to avoid long blocking commands.
+
+Deep Sleep and Resume:
+
+DEEP_SLEEP causes a full chip restart. All RAM-based variables are lost. Only data in RTC_DATA_ATTR variables (like rtcResumeFlowIndex and rtcWakeFromSleep) persists.
+
+The SAVE_RESUME_POINT command merely stores the target label's index in the programFlow into RTC memory.
+
+Your commands.txt must include the initial IF rtcWakeFromSleep == 1 THEN GOTO RESUME_FROM_SLEEP (or similar logic) to make use of the resume functionality. Without it, the script will always start from INIT_BOOT.
+
+If you need to persist other variables (e.g., globalDelay or temperature) across deep sleep, you'll need to declare them as RTC_DATA_ATTR in the C++ code and store/retrieve their values from there, as the interpreter's variables and string_variables maps are reset on every boot.
+
+Variable Scope: All variables (numerical and string) defined via LET/SET are global, but they are reset on every reboot (including waking from deep sleep). Only RTC_DATA_ATTR variables in the C++ code persist.
+
+LOOP FOREVER: Be cautious with LOOP FOREVER in command blocks if it's not the last instruction in your overall programFlow, as it will prevent the program from ever moving past that block.
+
+Unreachable Code: If you have GOTO or END commands, parts of your commands.txt file might become unreachable. The interpreter will load them but never execute them.
+
+This manual should help you unlock the full potential of your advanced ESP32-S3 interpreter! Happy coding!
