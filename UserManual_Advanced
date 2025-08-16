@@ -8,7 +8,7 @@ To use the interpreter, you need:
 
 An ESP32 or ESP32-S3 board (should work with any Espressif Boards)
 
-An SD card module connected to your ESP32-S3. The SD_CS_PIN is configured as GPIO 10 in the code. Adjust this if your hardware setup differs.
+An SD card module connected to your ESP32-S3. The SD_CS_PIN is configured as GPIO 5 in the code. Adjust this if your hardware setup differs.
 
 A commands.txt file on the root of your SD card. This file contains the script your interpreter will execute.
 
